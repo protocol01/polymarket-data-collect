@@ -47,12 +47,76 @@ import time
 import signal
 import argparse
 import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DATA_DIR = os.environ.get("DATA_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HTTP File Server (for downloading data from Railway)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DataFileHandler(BaseHTTPRequestHandler):
+    """Serves data files for download via browser."""
+
+    def log_message(self, fmt, *args):
+        pass  # Suppress default access logs
+
+    def do_GET(self):
+        data_dir = DATA_DIR
+
+        if self.path == "/" or self.path == "/data":
+            # List all data files
+            files = []
+            if os.path.isdir(data_dir):
+                for f in sorted(os.listdir(data_dir)):
+                    fpath = os.path.join(data_dir, f)
+                    if os.path.isfile(fpath):
+                        size_mb = os.path.getsize(fpath) / (1024 * 1024)
+                        files.append(f"<a href='/data/{f}'>{f}</a> ({size_mb:.1f} MB)")
+            html = "<h2>₿ Recorded Data Files</h2><ul>"
+            html += "".join(f"<li>{f}</li>" for f in files)
+            html += "</ul><p>Click to download.</p>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(html.encode())
+            return
+
+        if self.path.startswith("/data/"):
+            filename = self.path.split("/data/")[-1]
+            # Security: only serve files, no path traversal
+            if "/" in filename or ".." in filename:
+                self.send_error(403)
+                return
+            filepath = os.path.join(data_dir, filename)
+            if os.path.isfile(filepath):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition",
+                                 f"attachment; filename={filename}")
+                self.send_header("Content-Length", str(os.path.getsize(filepath)))
+                self.end_headers()
+                with open(filepath, "rb") as f:
+                    self.wfile.write(f.read())
+                return
+
+        self.send_error(404)
+
+
+def start_http_server(port: int = 8080):
+    """Start HTTP file server in a daemon thread."""
+    server = HTTPServer(("0.0.0.0", port), DataFileHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"  📡 HTTP server on port {port} — download files at /data/")
+    return server
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -474,9 +538,14 @@ def main():
                         help="Tick interval in seconds (default: 3)")
     parser.add_argument("--dir", type=str, default=DATA_DIR,
                         help=f"Data directory (default: {DATA_DIR})")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8080)),
+                        help="HTTP server port (default: 8080 or $PORT)")
     args = parser.parse_args()
 
     os.makedirs(args.dir, exist_ok=True)
+
+    # Start HTTP file server for data downloads
+    start_http_server(args.port)
 
     # File names with date for easy management
     date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
