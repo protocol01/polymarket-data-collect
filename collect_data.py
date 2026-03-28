@@ -558,22 +558,39 @@ def summarize_book(book: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def compress_old_files(data_dir: str):
-    """Gzip compress any .jsonl files from previous days (not today's)."""
+    """Gzip compress .jsonl files to save space.
+    
+    - Previous days' files: always compress
+    - Today's files: compress if > 100 MB (rotate with timestamp suffix)
+    """
     today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
     compressed_count = 0
+    SIZE_LIMIT = 100 * 1024 * 1024  # 100 MB
 
     for jsonl_file in glob.glob(os.path.join(data_dir, "*.jsonl")):
         basename = os.path.basename(jsonl_file)
-        # Skip today's active files
-        if today_str in basename:
+        file_size = os.path.getsize(jsonl_file)
+        
+        # Skip tiny files
+        if file_size < 1024:
             continue
-        # Skip already tiny files
-        if os.path.getsize(jsonl_file) < 1024:
-            continue
+
+        is_today = today_str in basename
+        
+        if is_today and file_size < SIZE_LIMIT:
+            continue  # Today's file is still small, skip
+        
+        if is_today:
+            # Today's file is too big — rotate it with timestamp
+            hour_str = datetime.now(timezone.utc).strftime("%H%M")
+            rotated = jsonl_file.replace(".jsonl", f"_{hour_str}.jsonl")
+            os.rename(jsonl_file, rotated)
+            jsonl_file = rotated
+            basename = os.path.basename(rotated)
 
         gz_file = jsonl_file + ".gz"
         if os.path.exists(gz_file):
-            continue  # Already compressed
+            continue
 
         try:
             original_size = os.path.getsize(jsonl_file) / (1024 * 1024)
@@ -581,14 +598,14 @@ def compress_old_files(data_dir: str):
                 with gzip.open(gz_file, "wb", compresslevel=6) as f_out:
                     f_out.write(f_in.read())
             compressed_size = os.path.getsize(gz_file) / (1024 * 1024)
-            os.remove(jsonl_file)  # Delete original after compression
+            os.remove(jsonl_file)
             compressed_count += 1
             print(f"  📦 Compressed {basename}: {original_size:.1f} MB → {compressed_size:.1f} MB")
         except Exception as e:
             print(f"  ⚠️ Compression failed for {basename}: {e}")
 
     if compressed_count > 0:
-        print(f"  📦 Compressed {compressed_count} old files")
+        print(f"  📦 Compressed {compressed_count} files")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
