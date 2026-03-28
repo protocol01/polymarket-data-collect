@@ -48,6 +48,8 @@ import signal
 import argparse
 import requests
 import threading
+import gzip
+import glob
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -105,6 +107,31 @@ class DataFileHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 with open(filepath, "rb") as f:
                     self.wfile.write(f.read())
+                return
+
+        if self.path.startswith("/delete/"):
+            # Require secret key: /delete/filename?key=YOUR_SECRET
+            delete_key = os.environ.get("DELETE_KEY", "")
+            if not delete_key:
+                self.send_error(403, "Set DELETE_KEY env variable first")
+                return
+            if f"?key={delete_key}" not in self.path:
+                self.send_error(403, "Invalid key")
+                return
+            filename = self.path.split("/delete/")[-1].split("?")[0]
+            if "/" in filename or ".." in filename:
+                self.send_error(403)
+                return
+            filepath = os.path.join(data_dir, filename)
+            if os.path.isfile(filepath):
+                size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                os.remove(filepath)
+                html = f"<h2>Deleted {filename} ({size_mb:.1f} MB)</h2>"
+                html += "<a href='/'>Back to files</a>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(html.encode())
                 return
 
         self.send_error(404)
@@ -527,6 +554,44 @@ def summarize_book(book: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Auto-Compression (saves ~90% disk space)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compress_old_files(data_dir: str):
+    """Gzip compress any .jsonl files from previous days (not today's)."""
+    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    compressed_count = 0
+
+    for jsonl_file in glob.glob(os.path.join(data_dir, "*.jsonl")):
+        basename = os.path.basename(jsonl_file)
+        # Skip today's active files
+        if today_str in basename:
+            continue
+        # Skip already tiny files
+        if os.path.getsize(jsonl_file) < 1024:
+            continue
+
+        gz_file = jsonl_file + ".gz"
+        if os.path.exists(gz_file):
+            continue  # Already compressed
+
+        try:
+            original_size = os.path.getsize(jsonl_file) / (1024 * 1024)
+            with open(jsonl_file, "rb") as f_in:
+                with gzip.open(gz_file, "wb", compresslevel=6) as f_out:
+                    f_out.write(f_in.read())
+            compressed_size = os.path.getsize(gz_file) / (1024 * 1024)
+            os.remove(jsonl_file)  # Delete original after compression
+            compressed_count += 1
+            print(f"  📦 Compressed {basename}: {original_size:.1f} MB → {compressed_size:.1f} MB")
+        except Exception as e:
+            print(f"  ⚠️ Compression failed for {basename}: {e}")
+
+    if compressed_count > 0:
+        print(f"  📦 Compressed {compressed_count} old files")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Main Recorder
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -546,6 +611,17 @@ def main():
 
     # Start HTTP file server for data downloads
     start_http_server(args.port)
+
+    # Compress old data files (saves ~90% space)
+    compress_old_files(args.dir)
+
+    # Auto-compress every hour in background
+    def compression_loop(data_dir):
+        while True:
+            time.sleep(3600)  # Every hour
+            compress_old_files(data_dir)
+    compress_thread = threading.Thread(target=compression_loop, args=(args.dir,), daemon=True)
+    compress_thread.start()
 
     # File names with date for easy management
     date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
