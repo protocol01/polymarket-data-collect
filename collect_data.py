@@ -560,7 +560,7 @@ def summarize_book(book: dict) -> dict:
 def compress_old_files(data_dir: str):
     """Gzip compress .jsonl files to save space.
     
-    - Previous days' files: always compress
+    - Previous days' files: always compress (with timestamp to avoid skip)
     - Today's files: compress if > 100 MB (rotate with timestamp suffix)
     """
     today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -580,17 +580,17 @@ def compress_old_files(data_dir: str):
         if is_today and file_size < SIZE_LIMIT:
             continue  # Today's file is still small, skip
         
-        if is_today:
-            # Today's file is too big — rotate it with timestamp
-            hour_str = datetime.now(timezone.utc).strftime("%H%M")
-            rotated = jsonl_file.replace(".jsonl", f"_{hour_str}.jsonl")
+        # Always rotate with timestamp to avoid gz name conflicts
+        hour_str = datetime.now(timezone.utc).strftime("%H%M%S")
+        rotated = jsonl_file.replace(".jsonl", f"_{hour_str}.jsonl")
+        try:
             os.rename(jsonl_file, rotated)
-            jsonl_file = rotated
-            basename = os.path.basename(rotated)
+        except OSError:
+            continue
+        jsonl_file = rotated
+        basename = os.path.basename(rotated)
 
         gz_file = jsonl_file + ".gz"
-        if os.path.exists(gz_file):
-            continue
 
         try:
             original_size = os.path.getsize(jsonl_file) / (1024 * 1024)
@@ -640,11 +640,16 @@ def main():
     compress_thread = threading.Thread(target=compression_loop, args=(args.dir,), daemon=True)
     compress_thread.start()
 
-    # File names with date for easy management
-    date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-    tick_file = os.path.join(args.dir, f"ticks_{date_str}.jsonl")
-    book_file = os.path.join(args.dir, f"books_{date_str}.jsonl")
-    window_file = os.path.join(args.dir, f"windows_{date_str}.jsonl")
+    # File names with date for easy management (these get updated at midnight)
+    def make_file_paths(data_dir):
+        d = datetime.now(timezone.utc).strftime("%Y%m%d")
+        return (
+            d,
+            os.path.join(data_dir, f"ticks_{d}.jsonl"),
+            os.path.join(data_dir, f"books_{d}.jsonl"),
+            os.path.join(data_dir, f"windows_{d}.jsonl"),
+        )
+    date_str, tick_file, book_file, window_file = make_file_paths(args.dir)
 
     # Count existing data
     existing_ticks = 0
@@ -854,6 +859,12 @@ def main():
             print(f"  ❌ Error: {e}")
             import traceback
             traceback.print_exc()
+
+        # Rotate files at midnight UTC
+        new_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+        if new_date != date_str:
+            print(f"  🔄 Date changed {date_str} → {new_date}, rotating files...")
+            date_str, tick_file, book_file, window_file = make_file_paths(args.dir)
 
         # Sleep for remaining interval
         elapsed = time.time() - t0
