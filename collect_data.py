@@ -554,17 +554,70 @@ def summarize_book(book: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Auto-Compression (saves ~90% disk space)
+#  Single-File Archive (max 2 files per type: .jsonl + .jsonl.gz)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-KEEP_FILES = {"books.jsonl", "ticks.jsonl", "windows.jsonl"}
+# Only these files should exist on the volume
+KEEP_FILES = {
+    "books.jsonl", "ticks.jsonl", "windows.jsonl",
+    "books.jsonl.gz", "ticks.jsonl.gz", "windows.jsonl.gz",
+}
 
 
-def cleanup_extra_files(data_dir: str):
-    """Delete everything except the 3 main files.
+def archive_large_files(data_dir: str):
+    """When a .jsonl file exceeds 100 MB, append its data to .jsonl.gz archive.
     
-    Removes old date-based .jsonl files and .gz archives.
-    Only books.jsonl, ticks.jsonl, windows.jsonl should exist.
+    Uses gzip concatenation (valid per gzip spec) — no need to decompress
+    the existing archive. Very memory efficient (8 MB chunks).
+    
+    Result: max 2 files per type (books.jsonl + books.jsonl.gz)
+    """
+    SIZE_LIMIT = 100 * 1024 * 1024   # 100 MB
+    CHUNK_SIZE = 8 * 1024 * 1024     # 8 MB chunks
+
+    for name in ["books.jsonl", "ticks.jsonl", "windows.jsonl"]:
+        jsonl_path = os.path.join(data_dir, name)
+        if not os.path.exists(jsonl_path):
+            continue
+
+        try:
+            file_size = os.path.getsize(jsonl_path)
+        except OSError:
+            continue
+        if file_size < SIZE_LIMIT:
+            continue
+
+        archive_path = jsonl_path + ".gz"
+        orig_mb = file_size / (1024 * 1024)
+
+        try:
+            # Compress the active file and APPEND to archive
+            # (gzip concatenation is valid — gunzip handles it correctly)
+            with open(jsonl_path, "rb") as f_in:
+                with gzip.open(archive_path, "ab", compresslevel=6) as f_out:
+                    while True:
+                        chunk = f_in.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+
+            # Truncate the active file (don't delete — recorder keeps writing)
+            with open(jsonl_path, "w") as f:
+                pass
+
+            archive_mb = os.path.getsize(archive_path) / (1024 * 1024)
+            print(f"  📦 Archived {name}: {orig_mb:.1f} MB → {name}.gz ({archive_mb:.1f} MB total)")
+
+        except Exception as e:
+            print(f"  ⚠️ Archive failed for {name}: {e}")
+            # Don't delete anything on failure — data stays in .jsonl
+
+
+def cleanup_old_files(data_dir: str):
+    """Remove old timestamped files (leftovers from previous code versions).
+    
+    Only keeps: books.jsonl, ticks.jsonl, windows.jsonl and their .gz archives.
+    Does NOT delete data — only removes old format files.
     """
     removed = 0
     for f in os.listdir(data_dir):
@@ -573,15 +626,14 @@ def cleanup_extra_files(data_dir: str):
         if f.endswith(".jsonl") or f.endswith(".jsonl.gz"):
             path = os.path.join(data_dir, f)
             try:
+                size_mb = os.path.getsize(path) / (1024 * 1024)
                 os.remove(path)
                 removed += 1
-                print(f"  🗑️ Removed: {f}")
+                print(f"  🗑️ Removed old file: {f} ({size_mb:.1f} MB)")
             except OSError:
                 pass
     if removed:
-        print(f"  🗑️ Cleaned up {removed} extra files")
-    else:
-        print(f"  ✅ Clean: only 3 data files exist")
+        print(f"  🗑️ Cleaned up {removed} old files")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -605,10 +657,21 @@ def main():
     # Start HTTP file server for data downloads
     start_http_server(args.port)
 
-    # Delete all extra files — only keep books.jsonl, ticks.jsonl, windows.jsonl
-    cleanup_extra_files(args.dir)
+    # Remove old timestamped files from previous code versions
+    cleanup_old_files(args.dir)
 
-    # Single file per data type — grows without limit
+    # Archive any large files on startup
+    archive_large_files(args.dir)
+
+    # Archive check every 30 minutes
+    def archive_loop(data_dir):
+        while True:
+            time.sleep(1800)
+            archive_large_files(data_dir)
+    archive_thread = threading.Thread(target=archive_loop, args=(args.dir,), daemon=True)
+    archive_thread.start()
+
+    # Single file per data type
     tick_file = os.path.join(args.dir, "ticks.jsonl")
     book_file = os.path.join(args.dir, "books.jsonl")
     window_file = os.path.join(args.dir, "windows.jsonl")
