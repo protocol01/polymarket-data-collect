@@ -557,86 +557,31 @@ def summarize_book(book: dict) -> dict:
 #  Auto-Compression (saves ~90% disk space)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def compress_old_files(data_dir: str):
-    """Compress .jsonl files > 100 MB to save volume space.
+KEEP_FILES = {"books.jsonl", "ticks.jsonl", "windows.jsonl"}
+
+
+def cleanup_extra_files(data_dir: str):
+    """Delete everything except the 3 main files.
     
-    Renames active file with timestamp, gzips it in chunks, deletes original.
-    The recorder will create a fresh file on next write.
+    Removes old date-based .jsonl files and .gz archives.
+    Only books.jsonl, ticks.jsonl, windows.jsonl should exist.
     """
-    SIZE_LIMIT = 100 * 1024 * 1024  # 100 MB
-    CHUNK_SIZE = 8 * 1024 * 1024     # 8 MB chunks (avoid OOM)
-    compressed_count = 0
-
-    for jsonl_file in glob.glob(os.path.join(data_dir, "*.jsonl")):
-        try:
-            file_size = os.path.getsize(jsonl_file)
-        except OSError:
-            continue
-        if file_size < SIZE_LIMIT:
-            continue
-
-        # Rotate: books.jsonl → books_20260330_143022.jsonl.gz
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        base = os.path.basename(jsonl_file).replace(".jsonl", "")
-        archive = os.path.join(data_dir, f"{base}_{ts}.jsonl")
-        try:
-            os.rename(jsonl_file, archive)
-        except OSError:
-            continue
-
-        gz_file = archive + ".gz"
-        try:
-            orig_mb = os.path.getsize(archive) / (1024 * 1024)
-            with open(archive, "rb") as f_in:
-                with gzip.open(gz_file, "wb", compresslevel=6) as f_out:
-                    while True:
-                        chunk = f_in.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        f_out.write(chunk)
-            comp_mb = os.path.getsize(gz_file) / (1024 * 1024)
-            os.remove(archive)
-            compressed_count += 1
-            print(f"  📦 Compressed {base}: {orig_mb:.1f} MB → {comp_mb:.1f} MB")
-        except Exception as e:
-            print(f"  ⚠️ Compression failed for {base}: {e}")
-            # Clean up partial gz if it exists
-            if os.path.exists(gz_file):
-                try:
-                    os.remove(gz_file)
-                except OSError:
-                    pass
-            # Restore original file
-            if os.path.exists(archive) and not os.path.exists(jsonl_file):
-                try:
-                    os.rename(archive, jsonl_file)
-                except OSError:
-                    pass
-
-    if compressed_count > 0:
-        print(f"  📦 Compressed {compressed_count} files")
-
-
-def cleanup_old_dated_files(data_dir: str):
-    """Remove stale date-based files (e.g. books_20260330.jsonl).
-    
-    These are leftovers from before the single-file format.
-    Only remove if the main file (books.jsonl) already exists.
-    """
-    import re
-    date_pattern = re.compile(r"^(books|ticks|windows)_\d{8}\.jsonl$")
     removed = 0
     for f in os.listdir(data_dir):
-        if date_pattern.match(f):
+        if f in KEEP_FILES:
+            continue
+        if f.endswith(".jsonl") or f.endswith(".jsonl.gz"):
             path = os.path.join(data_dir, f)
             try:
                 os.remove(path)
                 removed += 1
-                print(f"  🗑️ Removed old file: {f}")
+                print(f"  🗑️ Removed: {f}")
             except OSError:
                 pass
     if removed:
-        print(f"  🗑️ Cleaned up {removed} old date-based files")
+        print(f"  🗑️ Cleaned up {removed} extra files")
+    else:
+        print(f"  ✅ Clean: only 3 data files exist")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -660,21 +605,10 @@ def main():
     # Start HTTP file server for data downloads
     start_http_server(args.port)
 
-    # Clean up old date-based files from previous format
-    cleanup_old_dated_files(args.dir)
+    # Delete all extra files — only keep books.jsonl, ticks.jsonl, windows.jsonl
+    cleanup_extra_files(args.dir)
 
-    # Compress old data files (saves ~90% space)
-    compress_old_files(args.dir)
-
-    # Auto-compress every 30 minutes in background
-    def compression_loop(data_dir):
-        while True:
-            time.sleep(1800)  # Every 30 min
-            compress_old_files(data_dir)
-    compress_thread = threading.Thread(target=compression_loop, args=(args.dir,), daemon=True)
-    compress_thread.start()
-
-    # Single file per data type — compression rotates when > 100 MB
+    # Single file per data type — grows without limit
     tick_file = os.path.join(args.dir, "ticks.jsonl")
     book_file = os.path.join(args.dir, "books.jsonl")
     window_file = os.path.join(args.dir, "windows.jsonl")
